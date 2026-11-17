@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { VoiceSession } from "@/lib/voice";
 import {
   loadConversations,
@@ -10,6 +12,18 @@ import {
   groupLabel,
 } from "@/lib/history";
 import { prepareImage, dataUrlToPart, MAX_IMAGES } from "@/lib/images";
+
+const SUGGESTIONS = [
+  { label: "📷 Analyze an image", image: true },
+  { label: "🗓 Plan my week", text: "Help me plan my week. Ask me what I have going on first." },
+  { label: "💡 Explain something simply", text: "Explain how compound interest works in simple terms." },
+  { label: "✉️ Write an email", text: "Help me write a short, polite email asking for a deadline extension." },
+];
+
+// Links in replies open in a new tab
+const MD_COMPONENTS = {
+  a: ({ node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+};
 
 const STATUS_LABEL = {
   idle: "Tap to talk",
@@ -30,6 +44,9 @@ export default function Home() {
   const [attachments, setAttachments] = useState([]); // images waiting to be sent
   const [dragging, setDragging] = useState(false);
   const fileRef = useRef(null);
+  const abortRef = useRef(null);
+  const [humanize, setHumanize] = useState(false);
+  const [copiedId, setCopiedId] = useState(null);
   const [loading, setLoading] = useState(false);
   const [password, setPassword] = useState("");
   const [needsPassword, setNeedsPassword] = useState(false);
@@ -54,6 +71,7 @@ export default function Home() {
     try {
       const pw = localStorage.getItem("makbot-password");
       if (pw) setPassword(pw);
+      setHumanize(localStorage.getItem("makbot-humanize") === "1");
     } catch {}
     setHydrated(true);
     return () => voiceRef.current?.stop();
@@ -146,33 +164,30 @@ export default function Home() {
   }
 
   // ---------- Text mode ----------
-  async function send(e) {
-    e.preventDefault();
-    const text = input.trim();
-    if ((!text && attachments.length === 0) || loading) return;
-
-    const sentImages = attachments;
-    const convId = ensureConversation();
-    const userMsg = { id: newId(), role: "user", content: text };
-    if (sentImages.length) userMsg.images = sentImages.map((a) => a.thumb);
-    const history = [...messages, userMsg];
+  // Streams a reply for `history` (which must end with a user message).
+  // fullImages: full-size data URLs for the last user message, if any.
+  async function runChat(convId, history, fullImages = null) {
     const replyId = newId();
-    updateMessages(convId, [...history, { id: replyId, role: "assistant", content: "" }]);
-    setInput("");
-    setAttachments([]);
+    const humanized = humanize;
+    const replyMsg = (content) => ({ id: replyId, role: "assistant", content, humanized });
+    updateMessages(convId, [...history, replyMsg("")]);
     setLoading(true);
     setError("");
 
-    // Full-size images for this message; small thumbnails for earlier ones
+    // Full-size images for the newest message; small thumbnails for earlier ones
     const payload = history.map((m, i) => {
       const out = { role: m.role, content: m.content };
-      const imgs = i === history.length - 1 ? sentImages.map((a) => a.full) : m.images;
+      const imgs = i === history.length - 1 && fullImages ? fullImages : m.images;
       if (imgs?.length) out.images = imgs.map(dataUrlToPart);
       return out;
     });
 
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let reply = "";
+
     try {
-      const bodyText = JSON.stringify({ messages: payload, password });
+      const bodyText = JSON.stringify({ messages: payload, password, humanize: humanized });
       if (bodyText.length > 4_000_000) {
         throw new Error("Those images are too large to send together. Try fewer images.");
       }
@@ -180,34 +195,101 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: bodyText,
+        signal: controller.signal,
       });
 
       if (res.status === 401) {
-        updateMessages(convId, history.slice(0, -1));
-        setInput(text);
-        setAttachments(sentImages);
+        updateMessages(convId, history);
         askForPassword();
-        return;
+        return { unauthorized: true };
       }
       if (!res.ok || !res.body) throw new Error(await res.text());
       rememberPassword();
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let reply = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         reply += decoder.decode(value, { stream: true });
-        updateMessages(convId, [...history, { id: replyId, role: "assistant", content: reply }]);
+        updateMessages(convId, [...history, replyMsg(reply)]);
       }
+      return { ok: true };
     } catch (err) {
+      if (err.name === "AbortError") {
+        // Stopped by the user: keep whatever arrived so far
+        updateMessages(convId, reply.trim() ? [...history, replyMsg(reply)] : history);
+        return { stopped: true };
+      }
       updateMessages(convId, history);
-      if (!text && sentImages.length) setAttachments(sentImages);
       setError(err.message || "Something went wrong.");
+      return { failed: true };
     } finally {
+      abortRef.current = null;
       setLoading(false);
     }
+  }
+
+  async function sendMessage(text, images = []) {
+    text = (text || "").trim();
+    if ((!text && images.length === 0) || loading) return;
+
+    const convId = ensureConversation();
+    const userMsg = { id: newId(), role: "user", content: text };
+    if (images.length) userMsg.images = images.map((a) => a.thumb);
+    const history = [...messages, userMsg];
+    setInput("");
+    setAttachments([]);
+
+    const result = await runChat(
+      convId,
+      history,
+      images.length ? images.map((a) => a.full) : null
+    );
+    if (result?.unauthorized || (result?.failed && !text && images.length)) {
+      // put the message back so they can resend it
+      updateMessages(convId, messages);
+      setInput(text);
+      setAttachments(images);
+    }
+  }
+
+  function send(e) {
+    e.preventDefault();
+    sendMessage(input, attachments);
+  }
+
+  function stop() {
+    abortRef.current?.abort();
+  }
+
+  // Re-answer the last user message
+  function regenerate() {
+    if (busy || !active) return;
+    let lastUser = -1;
+    messages.forEach((m, i) => {
+      if (m.role === "user") lastUser = i;
+    });
+    if (lastUser === -1) return;
+    runChat(active.id, messages.slice(0, lastUser + 1));
+  }
+
+  async function copyText(id, text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedId(id);
+      setTimeout(() => setCopiedId((c) => (c === id ? null : c)), 1500);
+    } catch {
+      setError("Couldn't copy. Select the text and copy it manually.");
+    }
+  }
+
+  function toggleHumanize() {
+    const next = !humanize;
+    setHumanize(next);
+    try {
+      localStorage.setItem("makbot-humanize", next ? "1" : "0");
+    } catch {}
   }
 
   // ---------- Images ----------
@@ -273,7 +355,7 @@ export default function Home() {
     });
     voiceRef.current = v;
     try {
-      await v.start(password);
+      await v.start(password, { humanize });
       rememberPassword();
     } catch (err) {
       v.stop();
@@ -352,6 +434,17 @@ export default function Home() {
           </button>
           <div className="logo">M</div>
           <h1>Makbot</h1>
+          <button
+            className={`humanize ${humanize ? "on" : ""}`}
+            onClick={toggleHumanize}
+            disabled={busy}
+            role="switch"
+            aria-checked={humanize}
+            title="Humanizer: plain, direct, conversational replies"
+          >
+            <span className="knob" />
+            Humanizer
+          </button>
           <div className="toggle" role="tablist">
             <button className={mode === "text" ? "on" : ""} onClick={() => switchMode("text")}>
               Text
@@ -369,6 +462,22 @@ export default function Home() {
               <p>
                 {mode === "text" ? "Type a message to start." : "Tap the mic and start talking."}
               </p>
+              {mode === "text" && (
+                <div className="suggestions">
+                  {SUGGESTIONS.map((sug) => (
+                    <button
+                      key={sug.label}
+                      className="suggestion"
+                      onClick={() =>
+                        sug.image ? fileRef.current?.click() : sendMessage(sug.text)
+                      }
+                      disabled={loading}
+                    >
+                      {sug.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
           {messages.map((m, i) => (
@@ -383,8 +492,29 @@ export default function Home() {
                   </div>
                 )}
                 {m.voice && <span className="tag">🎙</span>}
-                {m.content || (loading && i === messages.length - 1 ? "…" : "")}
+                {m.role === "assistant" && m.content ? (
+                  <div className="md">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+                      {m.content}
+                    </ReactMarkdown>
+                  </div>
+                ) : (
+                  m.content || (loading && i === messages.length - 1 ? <span className="dots">…</span> : "")
+                )}
               </div>
+              {m.role === "assistant" && m.content && !(loading && i === messages.length - 1) && (
+                <div className="actions">
+                  <button onClick={() => copyText(m.id, m.content)} title="Copy reply">
+                    {copiedId === m.id ? "✓ Copied" : "Copy"}
+                  </button>
+                  {i === messages.length - 1 && !m.voice && (
+                    <button onClick={regenerate} disabled={busy} title="Get a new answer">
+                      ↻ Regenerate
+                    </button>
+                  )}
+                  {m.humanized && <span className="badge">Humanized</span>}
+                </div>
+              )}
             </div>
           ))}
           <div ref={bottomRef} />
@@ -467,9 +597,15 @@ export default function Home() {
               placeholder={attachments.length ? "Ask about the image…" : "Message Makbot…"}
               rows={1}
             />
-            <button type="submit" disabled={loading || (!input.trim() && !attachments.length)}>
-              {loading ? "…" : "Send"}
-            </button>
+            {loading ? (
+              <button type="button" className="stop" onClick={stop} title="Stop generating">
+                ■ Stop
+              </button>
+            ) : (
+              <button type="submit" disabled={!input.trim() && !attachments.length}>
+                Send
+              </button>
+            )}
           </form>
         ) : (
           <div className="voicebar">

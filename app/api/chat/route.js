@@ -1,6 +1,6 @@
 // Text chat: runs on the server, so your Gemini key never reaches the browser.
 import { GoogleGenAI } from "@google/genai";
-import { SYSTEM_PROMPT, TEXT_MODELS, checkPassword, getApiKey } from "@/lib/config";
+import { buildSystemPrompt, TEXT_MODELS, checkPassword, getApiKey } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const maxDuration = 60; // seconds; streaming keeps long replies alive
@@ -77,7 +77,7 @@ export async function POST(req) {
       const result = await ai.models.generateContentStream({
         model,
         contents,
-        config: { systemInstruction: SYSTEM_PROMPT },
+        config: { systemInstruction: buildSystemPrompt(body.humanize === true) },
       });
       iterator = result[Symbol.asyncIterator]();
       // Wait for the first chunk: "busy" errors often arrive here, not on the call
