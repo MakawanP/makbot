@@ -57,7 +57,13 @@ export async function POST(req) {
     return new Response("No message to answer.", { status: 400 });
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  // Don't let the SDK retry a busy model with long waits: move straight to the
+  // next model instead. Only the last model in the list gets a couple of retries.
+  const fastClient = new GoogleGenAI({ apiKey, httpOptions: { retryOptions: { attempts: 1 } } });
+  const lastClient = new GoogleGenAI({
+    apiKey,
+    httpOptions: { retryOptions: { attempts: 3, initialDelay: 1, maxDelay: 4 } },
+  });
 
   // Try each model in order until one starts answering.
   let iterator = null;
@@ -65,7 +71,8 @@ export async function POST(req) {
   let usedModel = null;
   const failures = [];
 
-  for (const model of TEXT_MODELS) {
+  for (const [i, model] of TEXT_MODELS.entries()) {
+    const ai = i === TEXT_MODELS.length - 1 ? lastClient : fastClient;
     try {
       const result = await ai.models.generateContentStream({
         model,
