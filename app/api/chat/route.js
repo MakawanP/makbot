@@ -3,7 +3,13 @@ import { GoogleGenAI } from "@google/genai";
 import { buildSystemPrompt, TEXT_MODELS, checkPassword, getApiKey } from "@/lib/config";
 
 export const runtime = "nodejs";
-export const maxDuration = 60; // seconds; streaming keeps long replies alive
+export const maxDuration = 300; // 5 minutes; Vercel stops the function after this
+
+// Time limits (milliseconds)
+const DEADLINE_MS = 290_000; // finish the reply cleanly before Vercel's 5-minute limit
+const FIRST_CHUNK_MS = 30_000; // each model gets this long to start answering
+const LAST_FIRST_CHUNK_MS = 90_000; // the final fallback gets longer (big prompts, images)
+const IDLE_MS = 60_000; // give up if a reply stops mid-way for this long
 
 const MAX_MESSAGES = 30;
 const MAX_CHARS = 8000;
@@ -62,36 +68,64 @@ export async function POST(req) {
   const fastClient = new GoogleGenAI({ apiKey, httpOptions: { retryOptions: { attempts: 1 } } });
   const lastClient = new GoogleGenAI({
     apiKey,
-    httpOptions: { retryOptions: { attempts: 3, initialDelay: 1, maxDelay: 4 } },
+    httpOptions: { retryOptions: { attempts: 2, initialDelay: 1, maxDelay: 2 } },
   });
+
+  const startedAt = Date.now();
+  const timeLeft = () => DEADLINE_MS - (Date.now() - startedAt);
 
   // Try each model in order until one starts answering.
   let iterator = null;
   let first = null;
   let usedModel = null;
+  let modelAbort = null;
   const failures = [];
 
   for (const [i, model] of TEXT_MODELS.entries()) {
-    const ai = i === TEXT_MODELS.length - 1 ? lastClient : fastClient;
+    const isLast = i === TEXT_MODELS.length - 1;
+    const ai = isLast ? lastClient : fastClient;
+    // Give each model a limited time to start answering. Gemini sometimes hangs
+    // without returning an error when it's overloaded.
+    const wait = Math.min(isLast ? LAST_FIRST_CHUNK_MS : FIRST_CHUNK_MS, timeLeft() - 5_000);
+    if (wait < 3_000) {
+      failures.push(`${model}: skipped (out of time)`);
+      break;
+    }
+    const abort = new AbortController();
+    const onClientGone = () => abort.abort();
+    req.signal?.addEventListener("abort", onClientGone);
+    const timer = setTimeout(() => abort.abort(new Error("timeout")), wait);
     try {
       const result = await ai.models.generateContentStream({
         model,
         contents,
-        config: { systemInstruction: buildSystemPrompt(body.humanize === true) },
+        config: {
+          systemInstruction: buildSystemPrompt(body.humanize === true),
+          abortSignal: abort.signal,
+        },
       });
       iterator = result[Symbol.asyncIterator]();
       // Wait for the first chunk: "busy" errors often arrive here, not on the call
       first = await iterator.next();
+      clearTimeout(timer);
       usedModel = model;
+      modelAbort = abort;
       break;
     } catch (err) {
-      failures.push(`${model}: ${shortError(err)}`);
-      if (!isRetryable(err)) break; // e.g. bad API key: no point trying others
+      clearTimeout(timer);
+      req.signal?.removeEventListener("abort", onClientGone);
+      iterator = null;
+      if (req.signal?.aborted) return new Response(null, { status: 499 }); // user hit Stop
+      const timedOut = abort.signal.aborted;
+      const reason = timedOut ? `no response after ${Math.round(wait / 1000)}s` : shortError(err);
+      failures.push(`${model}: ${reason}`);
+      console.warn(`[makbot] ${model} failed, trying next:`, reason);
+      if (!timedOut && !isRetryable(err)) break; // e.g. bad API key: no point trying others
     }
   }
 
   if (!iterator) {
-    console.error("All Gemini models failed:", failures);
+    console.error("[makbot] All Gemini models failed:", failures);
     const allBusy = failures.length === TEXT_MODELS.length;
     return new Response(
       allBusy
@@ -101,24 +135,59 @@ export async function POST(req) {
     );
   }
 
+  if (failures.length) console.warn(`[makbot] answered by ${usedModel} after:`, failures);
+
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
+      let idleTimer = null;
+      let deadlineTimer = null;
+      let stopReason = null;
+      const resetIdle = () => {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          stopReason = "idle";
+          modelAbort.abort();
+        }, IDLE_MS);
+      };
+      // Finish cleanly before Vercel's hard limit instead of erroring
+      deadlineTimer = setTimeout(() => {
+        stopReason = "deadline";
+        modelAbort.abort();
+      }, Math.max(1_000, timeLeft()));
+
       try {
         if (!first.done && first.value?.text) {
           controller.enqueue(encoder.encode(first.value.text));
         }
+        resetIdle();
         while (!first.done) {
           const next = await iterator.next();
           if (next.done) break;
+          resetIdle();
           const text = next.value?.text;
           if (text) controller.enqueue(encoder.encode(text));
         }
-      } catch {
-        controller.enqueue(encoder.encode("\n\n[Stream interrupted]"));
+      } catch (err) {
+        if (stopReason === "deadline") {
+          controller.enqueue(encoder.encode("\n\n[Reply cut short: it took too long. Ask me to continue.]"));
+        } else if (stopReason === "idle") {
+          console.warn(`[makbot] ${usedModel} stalled mid-reply`);
+          controller.enqueue(encoder.encode("\n\n[Reply stalled. Try Regenerate.]"));
+        } else if (!req.signal?.aborted) {
+          console.warn(`[makbot] stream error from ${usedModel}:`, shortError(err));
+          controller.enqueue(encoder.encode("\n\n[Stream interrupted]"));
+        }
       } finally {
-        controller.close();
+        clearTimeout(idleTimer);
+        clearTimeout(deadlineTimer);
+        try {
+          controller.close();
+        } catch {}
       }
+    },
+    cancel() {
+      modelAbort?.abort(); // browser went away or user hit Stop
     },
   });
 
