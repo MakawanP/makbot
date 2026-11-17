@@ -7,6 +7,9 @@ export const maxDuration = 60; // seconds; streaming keeps long replies alive
 
 const MAX_MESSAGES = 30;
 const MAX_CHARS = 8000;
+const MAX_IMAGES = 4; // per message
+const MAX_IMAGE_CHARS = 2_500_000; // ~1.8 MB per image after base64
+const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
 
 export async function POST(req) {
   const apiKey = getApiKey();
@@ -25,19 +28,30 @@ export async function POST(req) {
   if (denied) return denied;
 
   // Basic input limits to keep costs predictable.
-  // Gemini uses the roles "user" and "model".
+  // Gemini uses the roles "user" and "model". User messages may carry images.
   const contents = (Array.isArray(body.messages) ? body.messages : [])
-    .filter(
-      (m) =>
-        (m.role === "user" || m.role === "assistant") &&
-        typeof m.content === "string" &&
-        m.content.trim()
-    )
+    .filter((m) => m.role === "user" || m.role === "assistant")
     .slice(-MAX_MESSAGES)
-    .map((m) => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content.slice(0, MAX_CHARS) }],
-    }));
+    .map((m) => {
+      const parts = [];
+      if (m.role === "user" && Array.isArray(m.images)) {
+        for (const img of m.images.slice(0, MAX_IMAGES)) {
+          if (
+            img &&
+            ALLOWED_IMAGE_TYPES.includes(img.mimeType) &&
+            typeof img.data === "string" &&
+            img.data.length <= MAX_IMAGE_CHARS
+          ) {
+            parts.push({ inlineData: { mimeType: img.mimeType, data: img.data } });
+          }
+        }
+      }
+      const text = typeof m.content === "string" ? m.content.trim().slice(0, MAX_CHARS) : "";
+      if (text) parts.push({ text });
+      else if (parts.length) parts.push({ text: "Describe this image." });
+      return { role: m.role === "assistant" ? "model" : "user", parts };
+    })
+    .filter((c) => c.parts.length);
 
   if (contents.length === 0 || contents[contents.length - 1].role !== "user") {
     return new Response("No message to answer.", { status: 400 });
