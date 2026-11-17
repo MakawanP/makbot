@@ -33,11 +33,15 @@ mic on `localhost` and on HTTPS sites, so it works on Vercel.
    - `GEMINI_API_KEY`: your key (required)
    - `MAKBOT_PASSWORD`: optional; set it to keep strangers from using your credits
    - `GEMINI_TEXT_MODEL` / `GEMINI_LIVE_MODEL`: optional; override the default models
+   - `GEMINI_TEXT_MODELS`: optional comma-separated fallback list for text chat
 4. Click **Deploy**.
 
 If you change environment variables later, redeploy so they take effect.
 
 ## Notes
+
+- Text chat falls back automatically: if a model is busy or rate-limited it tries
+  `gemini-3.8-flash` → `gemini-3.6-flash` → `gemini-3.5-flash-lite`.
 
 - Voice sessions last up to 30 minutes per tap. Tap the mic again to start a new one.
 - Use headphones for the best voice experience; speakers can cause echo.

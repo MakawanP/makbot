@@ -1,6 +1,6 @@
 // Text chat: runs on the server, so your Gemini key never reaches the browser.
 import { GoogleGenAI } from "@google/genai";
-import { SYSTEM_PROMPT, TEXT_MODEL, checkPassword, getApiKey } from "@/lib/config";
+import { SYSTEM_PROMPT, TEXT_MODELS, checkPassword, getApiKey } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const maxDuration = 60; // seconds; streaming keeps long replies alive
@@ -45,23 +45,52 @@ export async function POST(req) {
 
   const ai = new GoogleGenAI({ apiKey });
 
-  let result;
-  try {
-    result = await ai.models.generateContentStream({
-      model: TEXT_MODEL,
-      contents,
-      config: { systemInstruction: SYSTEM_PROMPT },
-    });
-  } catch (err) {
-    return new Response(`Gemini error: ${err.message}`, { status: 502 });
+  // Try each model in order until one starts answering.
+  let iterator = null;
+  let first = null;
+  let usedModel = null;
+  const failures = [];
+
+  for (const model of TEXT_MODELS) {
+    try {
+      const result = await ai.models.generateContentStream({
+        model,
+        contents,
+        config: { systemInstruction: SYSTEM_PROMPT },
+      });
+      iterator = result[Symbol.asyncIterator]();
+      // Wait for the first chunk: "busy" errors often arrive here, not on the call
+      first = await iterator.next();
+      usedModel = model;
+      break;
+    } catch (err) {
+      failures.push(`${model}: ${shortError(err)}`);
+      if (!isRetryable(err)) break; // e.g. bad API key: no point trying others
+    }
+  }
+
+  if (!iterator) {
+    console.error("All Gemini models failed:", failures);
+    const allBusy = failures.length === TEXT_MODELS.length;
+    return new Response(
+      allBusy
+        ? "Gemini is very busy right now. Please try again in a minute."
+        : `Gemini error: ${failures[failures.length - 1]}`,
+      { status: 503 }
+    );
   }
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        for await (const chunk of result) {
-          const text = chunk.text;
+        if (!first.done && first.value?.text) {
+          controller.enqueue(encoder.encode(first.value.text));
+        }
+        while (!first.done) {
+          const next = await iterator.next();
+          if (next.done) break;
+          const text = next.value?.text;
           if (text) controller.enqueue(encoder.encode(text));
         }
       } catch {
@@ -76,6 +105,22 @@ export async function POST(req) {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "no-cache",
+      "X-Makbot-Model": usedModel, // which model answered (visible in dev tools)
     },
   });
+}
+
+// Busy, rate-limited, temporarily broken, or model not found -> try the next model.
+function isRetryable(err) {
+  const status = Number(err?.status);
+  if ([404, 408, 429, 500, 502, 503, 504].includes(status)) return true;
+  return /UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|NOT_FOUND|fetch failed/i.test(
+    String(err?.message || "")
+  );
+}
+
+function shortError(err) {
+  const msg = String(err?.message || err);
+  const match = msg.match(/"message":\s*"([^"]+)"/);
+  return (err?.status ? `${err.status} ` : "") + (match ? match[1] : msg).slice(0, 200);
 }
