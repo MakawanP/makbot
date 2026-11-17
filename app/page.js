@@ -252,6 +252,7 @@ export default function Home() {
             replyMsg(reply, {
               sources: meta.sources?.length ? meta.sources : undefined,
               searchHtml: meta.searchHtml || undefined,
+              searchSkipped: meta.searchSkipped || undefined,
             }),
           ]);
         } catch {}
@@ -666,6 +667,11 @@ export default function Home() {
                       {j + 1}. {src.title}
                     </a>
                   ))}
+                </div>
+              )}
+              {m.searchSkipped && (
+                <div className="muted small searchnote">
+                  🌐 Web search wasn't available for this reply (Gemini quota), so it answered without it.
                 </div>
               )}
               {m.searchHtml && (

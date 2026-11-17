@@ -2,6 +2,13 @@
 import { GoogleGenAI } from "@google/genai";
 import { buildSystemPrompt, MODES, TEXT_MODELS, checkPassword, getApiKey } from "@/lib/config";
 
+// Remembers models that just failed so the next requests skip them for a while
+// (kept in memory while this server instance stays warm).
+const cooldown = new Map(); // "model|search" -> timestamp when it can be tried again
+const COOLDOWN_QUOTA_MS = 10 * 60_000; // out of quota (429)
+const COOLDOWN_STALL_MS = 3 * 60_000; // didn't respond in time
+const COOLDOWN_BUSY_MS = 60_000; // 503 / overloaded
+
 // Marks the end of the reply text; source info follows as JSON
 const META_MARKER = "\u001eMAKBOT_META";
 
@@ -83,8 +90,12 @@ export async function POST(req) {
 
   // Each attempt is a model + whether web search is on. With search on, the last
   // resort is answering without search, so a search problem never blocks a reply.
-  const attempts = TEXT_MODELS.map((model) => ({ model, search: wantSearch }));
-  if (wantSearch) attempts.push({ model: TEXT_MODELS[TEXT_MODELS.length > 1 ? 1 : 0], search: false });
+  let attempts = TEXT_MODELS.map((model) => ({ model, search: wantSearch }));
+  if (wantSearch) attempts.push(...TEXT_MODELS.map((model) => ({ model, search: false })));
+  // Models on cooldown go to the back of the line (still tried if nothing else works)
+  const now = Date.now();
+  const cooling = (a) => (cooldown.get(`${a.model}|${a.search}`) || 0) > now;
+  attempts = [...attempts.filter((a) => !cooling(a)), ...attempts.filter(cooling)];
 
   // Try each attempt in order until one starts answering.
   let iterator = null;
@@ -138,6 +149,15 @@ export async function POST(req) {
       console.warn(`[makbot] ${label} failed, trying next:`, reason);
       // A 400 with search on may just mean "search not available": keep going.
       const searchProblem = search && Number(err?.status) === 400;
+      const status = Number(err?.status);
+      const pause = timedOut
+        ? COOLDOWN_STALL_MS
+        : status === 429
+          ? COOLDOWN_QUOTA_MS
+          : [500, 502, 503, 504].includes(status) || searchProblem
+            ? COOLDOWN_BUSY_MS
+            : 0;
+      if (pause) cooldown.set(`${model}|${search}`, Date.now() + pause);
       if (!timedOut && !searchProblem && !isRetryable(err)) break; // e.g. bad API key
     }
   }
@@ -197,7 +217,9 @@ export async function POST(req) {
           if (text) controller.enqueue(encoder.encode(text));
         }
         // Send sources after the text
-        if (usedSearch && grounding) {
+        if (wantSearch && !usedSearch) {
+          controller.enqueue(encoder.encode(META_MARKER + JSON.stringify({ searchSkipped: true })));
+        } else if (usedSearch && grounding) {
           const seen = new Set();
           const sources = (grounding.groundingChunks || [])
             .map((c) => c.web)
@@ -254,7 +276,22 @@ function isRetryable(err) {
 }
 
 function shortError(err) {
-  const msg = String(err?.message || err);
-  const match = msg.match(/"message":\s*"([^"]+)"/);
-  return (err?.status ? `${err.status} ` : "") + (match ? match[1] : msg).slice(0, 200);
+  // Gemini errors are often JSON nested inside JSON strings: dig out the real message
+  let status = err?.status ? String(err.status) : "";
+  let code = "";
+  let msg = String(err?.message || err);
+  for (let i = 0; i < 4; i++) {
+    try {
+      const j = JSON.parse(msg);
+      const e = j.error || j;
+      if (e.status) code = e.status;
+      if (e.code && !status) status = String(e.code);
+      if (typeof e.message !== "string") break;
+      msg = e.message;
+    } catch {
+      break;
+    }
+  }
+  msg = msg.replace(/\s+/g, " ").trim();
+  return [status, code].filter(Boolean).join(" ") + (msg ? `: ${msg.slice(0, 400)}` : "");
 }
