@@ -1,7 +1,7 @@
 // Voice chat: hands the browser a short-lived, single-use token for the
 // Gemini Live API. Your real key stays on the server.
 import { GoogleGenAI, Modality } from "@google/genai";
-import { buildSystemPrompt, LIVE_MODEL, checkPassword, getApiKey } from "@/lib/config";
+import { buildSystemPrompt, MODES, LIVE_MODEL, checkPassword, getApiKey } from "@/lib/config";
 
 export const runtime = "nodejs";
 
@@ -33,7 +33,12 @@ export async function POST(req) {
           model: LIVE_MODEL,
           config: {
             responseModalities: [Modality.AUDIO],
-            systemInstruction: buildSystemPrompt(body.humanize === true),
+            systemInstruction: buildSystemPrompt(
+              body.humanize === true,
+              MODES[body.mode] ? body.mode : "default",
+              body.search === true
+            ),
+            ...(body.search === true ? { tools: [{ googleSearch: {} }] } : {}),
             inputAudioTranscription: {},
             outputAudioTranscription: {},
           },

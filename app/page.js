@@ -11,14 +11,23 @@ import {
   titleFrom,
   groupLabel,
 } from "@/lib/history";
-import { prepareImage, dataUrlToPart, MAX_IMAGES } from "@/lib/images";
+import { prepareImage, dataUrlToPart, compressDataUrl, MAX_IMAGES } from "@/lib/images";
 
 const SUGGESTIONS = [
+  { label: "📰 What's in the news today?", text: "What are the top news stories today?", search: true },
+  { label: "🎨 Create an image", create: true },
   { label: "📷 Analyze an image", image: true },
-  { label: "🗓 Plan my week", text: "Help me plan my week. Ask me what I have going on first." },
-  { label: "💡 Explain something simply", text: "Explain how compound interest works in simple terms." },
   { label: "✉️ Write an email", text: "Help me write a short, polite email asking for a deadline extension." },
 ];
+
+const MODE_OPTIONS = [
+  { value: "default", label: "Default" },
+  { value: "fun", label: "😄 Fun" },
+  { value: "expert", label: "🎓 Expert" },
+  { value: "brief", label: "⚡ Brief" },
+];
+
+const META_MARKER = "\u001eMAKBOT_META";
 
 // Links in replies open in a new tab
 const MD_COMPONENTS = {
@@ -33,7 +42,7 @@ const STATUS_LABEL = {
 };
 
 export default function Home() {
-  const [mode, setMode] = useState("text"); // "text" | "voice"
+  const [chatMode, setChatMode] = useState("text"); // "text" | "voice"
   const [conversations, setConversations] = useState([]);
   const [activeId, setActiveId] = useState(null); // null = fresh, unsaved chat
   const [hydrated, setHydrated] = useState(false);
@@ -46,6 +55,10 @@ export default function Home() {
   const fileRef = useRef(null);
   const abortRef = useRef(null);
   const [humanize, setHumanize] = useState(false);
+  const [mode, setPersona] = useState("default"); // personality mode
+  const [search, setSearch] = useState(true); // web search on/off
+  const [imageMode, setImageMode] = useState(false); // next message creates an image
+  const inputRef = useRef(null);
   const [copiedId, setCopiedId] = useState(null);
   const [loading, setLoading] = useState(false);
   const [password, setPassword] = useState("");
@@ -72,6 +85,9 @@ export default function Home() {
       const pw = localStorage.getItem("makbot-password");
       if (pw) setPassword(pw);
       setHumanize(localStorage.getItem("makbot-humanize") === "1");
+      const savedMode = localStorage.getItem("makbot-mode");
+      if (savedMode && MODE_OPTIONS.some((m) => m.value === savedMode)) setPersona(savedMode);
+      setSearch(localStorage.getItem("makbot-search") !== "0");
     } catch {}
     setHydrated(true);
     return () => voiceRef.current?.stop();
@@ -169,14 +185,24 @@ export default function Home() {
   async function runChat(convId, history, fullImages = null) {
     const replyId = newId();
     const humanized = humanize;
-    const replyMsg = (content) => ({ id: replyId, role: "assistant", content, humanized });
+    const replyMsg = (content, extra = {}) => ({
+      id: replyId,
+      role: "assistant",
+      content,
+      humanized,
+      mode: mode !== "default" ? mode : undefined,
+      ...extra,
+    });
     updateMessages(convId, [...history, replyMsg("")]);
     setLoading(true);
     setError("");
 
     // Full-size images for the newest message; small thumbnails for earlier ones
     const payload = history.map((m, i) => {
-      const out = { role: m.role, content: m.content };
+      const out = {
+        role: m.role,
+        content: m.content || (m.genImages?.length ? "[Makbot created an image here]" : ""),
+      };
       const imgs = i === history.length - 1 && fullImages ? fullImages : m.images;
       if (imgs?.length) out.images = imgs.map(dataUrlToPart);
       return out;
@@ -187,7 +213,7 @@ export default function Home() {
     let reply = "";
 
     try {
-      const bodyText = JSON.stringify({ messages: payload, password, humanize: humanized });
+      const bodyText = JSON.stringify({ messages: payload, password, humanize: humanized, mode, search });
       if (bodyText.length > 4_000_000) {
         throw new Error("Those images are too large to send together. Try fewer images.");
       }
@@ -208,11 +234,27 @@ export default function Home() {
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      let raw = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        reply += decoder.decode(value, { stream: true });
+        raw += decoder.decode(value, { stream: true });
+        reply = raw.split(META_MARKER)[0];
         updateMessages(convId, [...history, replyMsg(reply)]);
+      }
+      // Sources from web search arrive after the text
+      const metaAt = raw.indexOf(META_MARKER);
+      if (metaAt !== -1) {
+        try {
+          const meta = JSON.parse(raw.slice(metaAt + META_MARKER.length));
+          updateMessages(convId, [
+            ...history,
+            replyMsg(reply, {
+              sources: meta.sources?.length ? meta.sources : undefined,
+              searchHtml: meta.searchHtml || undefined,
+            }),
+          ]);
+        } catch {}
       }
       return { ok: true };
     } catch (err) {
@@ -230,22 +272,75 @@ export default function Home() {
     }
   }
 
-  async function sendMessage(text, images = []) {
+  // Creates (or edits) an image for the last user message in `history`.
+  async function runImage(convId, history, prompt, inputImages = []) {
+    const replyId = newId();
+    updateMessages(convId, [
+      ...history,
+      { id: replyId, role: "assistant", content: "", generating: true },
+    ]);
+    setLoading(true);
+    setError("");
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      const res = await fetch("/api/image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, images: inputImages.map(dataUrlToPart), password }),
+        signal: controller.signal,
+      });
+      if (res.status === 401) {
+        updateMessages(convId, history);
+        askForPassword();
+        return { unauthorized: true };
+      }
+      if (!res.ok) throw new Error(await res.text());
+      rememberPassword();
+      const data = await res.json();
+      const genImages = await Promise.all(
+        (data.images || []).map((d) => compressDataUrl(d).catch(() => d))
+      );
+      updateMessages(convId, [
+        ...history,
+        {
+          id: replyId,
+          role: "assistant",
+          content: data.text || (genImages.length ? "" : "No image was created."),
+          genImages: genImages.length ? genImages : undefined,
+        },
+      ]);
+      return { ok: true };
+    } catch (err) {
+      updateMessages(convId, history);
+      if (err.name !== "AbortError") setError(err.message || "Couldn't create the image.");
+      return { failed: true };
+    } finally {
+      abortRef.current = null;
+      setLoading(false);
+    }
+  }
+
+  async function sendMessage(text, images = [], opts = {}) {
     text = (text || "").trim();
     if ((!text && images.length === 0) || loading) return;
+    const creating = opts.create ?? imageMode;
+    if (creating && !text) {
+      setError("Describe the image you want to create.");
+      return;
+    }
 
     const convId = ensureConversation();
     const userMsg = { id: newId(), role: "user", content: text };
     if (images.length) userMsg.images = images.map((a) => a.thumb);
+    if (creating) userMsg.kind = "image";
     const history = [...messages, userMsg];
     setInput("");
     setAttachments([]);
 
-    const result = await runChat(
-      convId,
-      history,
-      images.length ? images.map((a) => a.full) : null
-    );
+    const result = creating
+      ? await runImage(convId, history, text, images.map((a) => a.full))
+      : await runChat(convId, history, images.length ? images.map((a) => a.full) : null);
     if (result?.unauthorized || (result?.failed && !text && images.length)) {
       // put the message back so they can resend it
       updateMessages(convId, messages);
@@ -271,7 +366,10 @@ export default function Home() {
       if (m.role === "user") lastUser = i;
     });
     if (lastUser === -1) return;
-    runChat(active.id, messages.slice(0, lastUser + 1));
+    const u = messages[lastUser];
+    const history = messages.slice(0, lastUser + 1);
+    if (u.kind === "image") runImage(active.id, history, u.content, u.images || []);
+    else runChat(active.id, history);
   }
 
   async function copyText(id, text) {
@@ -282,6 +380,21 @@ export default function Home() {
     } catch {
       setError("Couldn't copy. Select the text and copy it manually.");
     }
+  }
+
+  function changeMode(next) {
+    setPersona(next);
+    try {
+      localStorage.setItem("makbot-mode", next);
+    } catch {}
+  }
+
+  function toggleSearch() {
+    const next = !search;
+    setSearch(next);
+    try {
+      localStorage.setItem("makbot-search", next ? "1" : "0");
+    } catch {}
   }
 
   function toggleHumanize() {
@@ -355,7 +468,7 @@ export default function Home() {
     });
     voiceRef.current = v;
     try {
-      await v.start(password, { humanize });
+      await v.start(password, { humanize, mode, search });
       rememberPassword();
     } catch (err) {
       v.stop();
@@ -373,10 +486,10 @@ export default function Home() {
   }
 
   function switchMode(next) {
-    if (next === mode) return;
+    if (next === chatMode) return;
     if (next === "text") stopVoice();
     setError("");
-    setMode(next);
+    setChatMode(next);
   }
 
   return (
@@ -434,6 +547,20 @@ export default function Home() {
           </button>
           <div className="logo">M</div>
           <h1>Makbot</h1>
+          <select
+            className="modepick"
+            value={mode}
+            onChange={(e) => changeMode(e.target.value)}
+            disabled={busy}
+            aria-label="Personality mode"
+            title="Personality mode"
+          >
+            {MODE_OPTIONS.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </select>
           <button
             className={`humanize ${humanize ? "on" : ""}`}
             onClick={toggleHumanize}
@@ -446,10 +573,10 @@ export default function Home() {
             Humanizer
           </button>
           <div className="toggle" role="tablist">
-            <button className={mode === "text" ? "on" : ""} onClick={() => switchMode("text")}>
+            <button className={chatMode === "text" ? "on" : ""} onClick={() => switchMode("text")}>
               Text
             </button>
-            <button className={mode === "voice" ? "on" : ""} onClick={() => switchMode("voice")}>
+            <button className={chatMode === "voice" ? "on" : ""} onClick={() => switchMode("voice")}>
               Voice
             </button>
           </div>
@@ -460,17 +587,26 @@ export default function Home() {
             <div className="empty">
               <h2>Hi, I&apos;m Makbot.</h2>
               <p>
-                {mode === "text" ? "Type a message to start." : "Tap the mic and start talking."}
+                {chatMode === "text" ? "Type a message to start." : "Tap the mic and start talking."}
               </p>
-              {mode === "text" && (
+              {chatMode === "text" && (
                 <div className="suggestions">
                   {SUGGESTIONS.map((sug) => (
                     <button
                       key={sug.label}
                       className="suggestion"
-                      onClick={() =>
-                        sug.image ? fileRef.current?.click() : sendMessage(sug.text)
-                      }
+                      onClick={() => {
+                        if (sug.image) {
+                          setImageMode(false);
+                          fileRef.current?.click();
+                        } else if (sug.create) {
+                          setImageMode(true);
+                          inputRef.current?.focus();
+                        } else {
+                          if (sug.search && !search) toggleSearch();
+                          sendMessage(sug.text, [], { create: false });
+                        }
+                      }}
                       disabled={loading}
                     >
                       {sug.label}
@@ -492,6 +628,21 @@ export default function Home() {
                   </div>
                 )}
                 {m.voice && <span className="tag">🎙</span>}
+                {m.kind === "image" && <span className="tag">🎨</span>}
+                {m.generating && <span className="dots">Creating image… this can take 10 to 30 seconds</span>}
+                {m.genImages?.length > 0 && (
+                  <div className="genimgs">
+                    {m.genImages.map((src, j) => (
+                      <a key={j} href={src} download={`makbot-image-${j + 1}.jpg`} title="Click to download">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={src} alt="Image created by Makbot" />
+                      </a>
+                    ))}
+                  </div>
+                )}
+                {m.imagesRemoved > 0 && (
+                  <div className="muted small">[{m.imagesRemoved} image(s) removed to free up storage]</div>
+                )}
                 {m.role === "assistant" && m.content ? (
                   <div className="md">
                     <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
@@ -499,20 +650,46 @@ export default function Home() {
                     </ReactMarkdown>
                   </div>
                 ) : (
-                  m.content || (loading && i === messages.length - 1 ? <span className="dots">…</span> : "")
+                  m.content ||
+                  (loading && i === messages.length - 1 && !m.generating ? (
+                    <span className="dots">{search && !m.genImages ? "Thinking… (may search the web)" : "…"}</span>
+                  ) : (
+                    ""
+                  ))
                 )}
               </div>
-              {m.role === "assistant" && m.content && !(loading && i === messages.length - 1) && (
+              {m.sources?.length > 0 && (
+                <div className="sources">
+                  <span className="srclabel">Sources</span>
+                  {m.sources.map((src, j) => (
+                    <a key={j} href={src.uri} target="_blank" rel="noopener noreferrer" title={src.title}>
+                      {j + 1}. {src.title}
+                    </a>
+                  ))}
+                </div>
+              )}
+              {m.searchHtml && (
+                <iframe
+                  className="searchchips"
+                  title="Google Search suggestions"
+                  sandbox="allow-popups allow-popups-to-escape-sandbox"
+                  srcDoc={`<base target="_blank"><style>body{margin:0;background:transparent}</style>${m.searchHtml}`}
+                />
+              )}
+              {m.role === "assistant" && (m.content || m.genImages?.length) && !(loading && i === messages.length - 1) && (
                 <div className="actions">
-                  <button onClick={() => copyText(m.id, m.content)} title="Copy reply">
-                    {copiedId === m.id ? "✓ Copied" : "Copy"}
-                  </button>
+                  {m.content && (
+                    <button onClick={() => copyText(m.id, m.content)} title="Copy reply">
+                      {copiedId === m.id ? "✓ Copied" : "Copy"}
+                    </button>
+                  )}
                   {i === messages.length - 1 && !m.voice && (
                     <button onClick={regenerate} disabled={busy} title="Get a new answer">
                       ↻ Regenerate
                     </button>
                   )}
                   {m.humanized && <span className="badge">Humanized</span>}
+                  {m.mode && <span className="badge alt">{MODE_OPTIONS.find((o) => o.value === m.mode)?.label}</span>}
                 </div>
               )}
             </div>
@@ -534,7 +711,7 @@ export default function Home() {
           </div>
         )}
 
-        {mode === "text" ? (
+        {chatMode === "text" ? (
           <form
             className={`composer ${dragging ? "dragging" : ""}`}
             onSubmit={send}
@@ -587,14 +764,41 @@ export default function Home() {
             >
               📎
             </button>
+            <button
+              type="button"
+              className={`tool ${search ? "on" : ""}`}
+              onClick={toggleSearch}
+              aria-pressed={search}
+              title={search ? "Web search is on" : "Web search is off"}
+            >
+              🌐
+            </button>
+            <button
+              type="button"
+              className={`tool ${imageMode ? "on create" : ""}`}
+              onClick={() => setImageMode((v) => !v)}
+              aria-pressed={imageMode}
+              title={imageMode ? "Image mode: your next message creates an image" : "Create an image"}
+            >
+              🎨
+            </button>
             <textarea
+              ref={inputRef}
               onPaste={onPaste}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) send(e);
               }}
-              placeholder={attachments.length ? "Ask about the image…" : "Message Makbot…"}
+              placeholder={
+                imageMode
+                  ? attachments.length
+                    ? "Describe how to change the image…"
+                    : "Describe the image to create…"
+                  : attachments.length
+                    ? "Ask about the image…"
+                    : "Message Makbot…"
+              }
               rows={1}
             />
             {loading ? (
@@ -603,7 +807,7 @@ export default function Home() {
               </button>
             ) : (
               <button type="submit" disabled={!input.trim() && !attachments.length}>
-                Send
+                {imageMode ? "Create" : "Send"}
               </button>
             )}
           </form>

@@ -1,6 +1,9 @@
 // Text chat: runs on the server, so your Gemini key never reaches the browser.
 import { GoogleGenAI } from "@google/genai";
-import { buildSystemPrompt, TEXT_MODELS, checkPassword, getApiKey } from "@/lib/config";
+import { buildSystemPrompt, MODES, TEXT_MODELS, checkPassword, getApiKey } from "@/lib/config";
+
+// Marks the end of the reply text; source info follows as JSON
+const META_MARKER = "\u001eMAKBOT_META";
 
 export const runtime = "nodejs";
 export const maxDuration = 300; // 5 minutes; Vercel stops the function after this
@@ -74,15 +77,25 @@ export async function POST(req) {
   const startedAt = Date.now();
   const timeLeft = () => DEADLINE_MS - (Date.now() - startedAt);
 
-  // Try each model in order until one starts answering.
+  const humanize = body.humanize === true;
+  const mode = MODES[body.mode] ? body.mode : "default";
+  const wantSearch = body.search === true;
+
+  // Each attempt is a model + whether web search is on. With search on, the last
+  // resort is answering without search, so a search problem never blocks a reply.
+  const attempts = TEXT_MODELS.map((model) => ({ model, search: wantSearch }));
+  if (wantSearch) attempts.push({ model: TEXT_MODELS[TEXT_MODELS.length > 1 ? 1 : 0], search: false });
+
+  // Try each attempt in order until one starts answering.
   let iterator = null;
   let first = null;
   let usedModel = null;
+  let usedSearch = false;
   let modelAbort = null;
   const failures = [];
 
-  for (const [i, model] of TEXT_MODELS.entries()) {
-    const isLast = i === TEXT_MODELS.length - 1;
+  for (const [i, { model, search }] of attempts.entries()) {
+    const isLast = i === attempts.length - 1;
     const ai = isLast ? lastClient : fastClient;
     // Give each model a limited time to start answering. Gemini sometimes hangs
     // without returning an error when it's overloaded.
@@ -100,7 +113,8 @@ export async function POST(req) {
         model,
         contents,
         config: {
-          systemInstruction: buildSystemPrompt(body.humanize === true),
+          systemInstruction: buildSystemPrompt(humanize, mode, search),
+          ...(search ? { tools: [{ googleSearch: {} }] } : {}),
           abortSignal: abort.signal,
         },
       });
@@ -109,6 +123,7 @@ export async function POST(req) {
       first = await iterator.next();
       clearTimeout(timer);
       usedModel = model;
+      usedSearch = search;
       modelAbort = abort;
       break;
     } catch (err) {
@@ -118,15 +133,18 @@ export async function POST(req) {
       if (req.signal?.aborted) return new Response(null, { status: 499 }); // user hit Stop
       const timedOut = abort.signal.aborted;
       const reason = timedOut ? `no response after ${Math.round(wait / 1000)}s` : shortError(err);
-      failures.push(`${model}: ${reason}`);
-      console.warn(`[makbot] ${model} failed, trying next:`, reason);
-      if (!timedOut && !isRetryable(err)) break; // e.g. bad API key: no point trying others
+      const label = `${model}${search ? " +search" : ""}`;
+      failures.push(`${label}: ${reason}`);
+      console.warn(`[makbot] ${label} failed, trying next:`, reason);
+      // A 400 with search on may just mean "search not available": keep going.
+      const searchProblem = search && Number(err?.status) === 400;
+      if (!timedOut && !searchProblem && !isRetryable(err)) break; // e.g. bad API key
     }
   }
 
   if (!iterator) {
     console.error("[makbot] All Gemini models failed:", failures);
-    const allBusy = failures.length === TEXT_MODELS.length;
+    const allBusy = failures.length === attempts.length;
     return new Response(
       allBusy
         ? "Gemini is very busy right now. Please try again in a minute."
@@ -156,17 +174,42 @@ export async function POST(req) {
         modelAbort.abort();
       }, Math.max(1_000, timeLeft()));
 
+      let grounding = null;
+      const collect = (chunk) => {
+        const g = chunk?.candidates?.[0]?.groundingMetadata;
+        if (g && (g.groundingChunks?.length || g.searchEntryPoint || g.webSearchQueries?.length)) {
+          grounding = g;
+        }
+      };
+
       try {
-        if (!first.done && first.value?.text) {
-          controller.enqueue(encoder.encode(first.value.text));
+        if (!first.done) {
+          collect(first.value);
+          if (first.value?.text) controller.enqueue(encoder.encode(first.value.text));
         }
         resetIdle();
         while (!first.done) {
           const next = await iterator.next();
           if (next.done) break;
           resetIdle();
+          collect(next.value);
           const text = next.value?.text;
           if (text) controller.enqueue(encoder.encode(text));
+        }
+        // Send sources after the text
+        if (usedSearch && grounding) {
+          const seen = new Set();
+          const sources = (grounding.groundingChunks || [])
+            .map((c) => c.web)
+            .filter((w) => w?.uri && !seen.has(w.uri) && seen.add(w.uri))
+            .slice(0, 8)
+            .map((w) => ({ title: w.title || w.uri, uri: w.uri }));
+          const meta = {
+            sources,
+            queries: grounding.webSearchQueries || [],
+            searchHtml: grounding.searchEntryPoint?.renderedContent || "",
+          };
+          controller.enqueue(encoder.encode(META_MARKER + JSON.stringify(meta)));
         }
       } catch (err) {
         if (stopReason === "deadline") {
@@ -196,6 +239,7 @@ export async function POST(req) {
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "no-cache",
       "X-Makbot-Model": usedModel, // which model answered (visible in dev tools)
+      "X-Makbot-Search": usedSearch ? "on" : "off",
     },
   });
 }

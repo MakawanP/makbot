@@ -452,3 +452,76 @@ button.ghost {
   .humanize::after { content: "H"; font-size: 12px; margin: 0 4px; }
   .suggestions { grid-template-columns: 1fr; }
 }
+
+/* ---------- Phase 1: modes, search, images ---------- */
+.modepick {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
+}
+.modepick:focus { border-color: var(--accent); }
+
+.tool {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 0 11px;
+  font-size: 17px;
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+.tool.on { filter: none; opacity: 1; border-color: var(--accent); }
+.tool.on.create { border-color: #d6409f; background: #2a1a26; }
+
+.sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 6px;
+  max-width: 85%;
+  padding-left: 4px;
+}
+.srclabel { font-size: 12px; color: var(--muted); margin-right: 2px; }
+.sources a {
+  font-size: 12px;
+  color: #c9ccd3;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  text-decoration: none;
+  max-width: 220px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.sources a:hover { border-color: var(--accent); color: var(--text); }
+.searchchips {
+  border: 0;
+  width: min(85%, 560px);
+  height: 64px;
+  margin-top: 4px;
+  color-scheme: normal;
+  border-radius: 10px;
+}
+
+.genimgs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+.genimgs img {
+  max-width: min(420px, 100%);
+  max-height: 420px;
+  border-radius: 12px;
+  display: block;
+  cursor: zoom-in;
+}
+.badge.alt { color: #7aa7ff; border-color: #24365c; }
+
+@media (max-width: 760px) {
+  .modepick { padding: 6px 6px; font-size: 12px; max-width: 92px; }
+  .tool { padding: 0 9px; }
+}
