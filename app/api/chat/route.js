@@ -1,6 +1,7 @@
 // Text chat: runs on the server, so your Gemini key never reaches the browser.
 import { GoogleGenAI } from "@google/genai";
 import { buildSystemPrompt, MODES, TEXT_MODELS, checkPassword, getApiKey } from "@/lib/config";
+import { SELF, SELF_ENABLED, SELF_ID, streamSelfHosted } from "@/lib/selfhosted";
 
 // Remembers models that just failed so the next requests skip them for a while
 // (kept in memory while this server instance stays warm).
@@ -29,8 +30,10 @@ const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
 
 export async function POST(req) {
   const apiKey = getApiKey();
-  if (!apiKey) {
-    return new Response("Server is missing GEMINI_API_KEY.", { status: 500 });
+  if (!apiKey && !SELF_ENABLED) {
+    return new Response("Server is missing GEMINI_API_KEY (or SELF_HOSTED_BASE_URL).", {
+      status: 500,
+    });
   }
 
   let body;
@@ -90,8 +93,16 @@ export async function POST(req) {
 
   // Each attempt is a model + whether web search is on. With search on, the last
   // resort is answering without search, so a search problem never blocks a reply.
-  let attempts = TEXT_MODELS.map((model) => ({ model, search: wantSearch }));
-  if (wantSearch) attempts.push(...TEXT_MODELS.map((model) => ({ model, search: false })));
+  // Order of providers:
+  //  - search on: Gemini with search, then your model (no search), then Gemini without search
+  //  - search off: your model first (or last, if SELF_HOSTED_PRIORITY=last), then Gemini
+  const gem = (search) =>
+    apiKey ? TEXT_MODELS.map((model) => ({ provider: "gemini", model, search })) : [];
+  const self = SELF_ENABLED ? [{ provider: "self", model: SELF_ID, search: false }] : [];
+  let attempts;
+  if (wantSearch) attempts = [...gem(true), ...self, ...gem(false)];
+  else if (SELF.priority === "last") attempts = [...gem(false), ...self];
+  else attempts = [...self, ...gem(false)];
   // Models on cooldown go to the back of the line (still tried if nothing else works)
   const now = Date.now();
   const cooling = (a) => (cooldown.get(`${a.model}|${a.search}`) || 0) > now;
@@ -105,12 +116,14 @@ export async function POST(req) {
   let modelAbort = null;
   const failures = [];
 
-  for (const [i, { model, search }] of attempts.entries()) {
+  for (const [i, { provider, model, search }] of attempts.entries()) {
     const isLast = i === attempts.length - 1;
     const ai = isLast ? lastClient : fastClient;
+    const isSelf = provider === "self";
     // Give each model a limited time to start answering. Gemini sometimes hangs
     // without returning an error when it's overloaded.
-    const wait = Math.min(isLast ? LAST_FIRST_CHUNK_MS : FIRST_CHUNK_MS, timeLeft() - 5_000);
+    const limit = isSelf ? SELF.firstChunkMs : isLast ? LAST_FIRST_CHUNK_MS : FIRST_CHUNK_MS;
+    const wait = Math.min(limit, timeLeft() - 5_000);
     if (wait < 3_000) {
       failures.push(`${model}: skipped (out of time)`);
       break;
@@ -120,20 +133,31 @@ export async function POST(req) {
     req.signal?.addEventListener("abort", onClientGone);
     const timer = setTimeout(() => abort.abort(new Error("timeout")), wait);
     try {
-      const result = await ai.models.generateContentStream({
-        model,
-        contents,
-        config: {
-          systemInstruction: buildSystemPrompt(humanize, mode, search),
-          ...(search ? { tools: [{ googleSearch: {} }] } : {}),
-          abortSignal: abort.signal,
-        },
-      });
-      iterator = result[Symbol.asyncIterator]();
-      // Wait for the first chunk: "busy" errors often arrive here, not on the call
-      first = await iterator.next();
+      if (isSelf) {
+        const gen = streamSelfHosted({
+          systemPrompt: buildSystemPrompt(humanize, mode, false),
+          contents,
+          signal: abort.signal,
+        });
+        iterator = gen[Symbol.asyncIterator]();
+        first = await iterator.next();
+        if (first.done) throw new Error("empty reply from self-hosted model");
+      } else {
+        const result = await ai.models.generateContentStream({
+          model,
+          contents,
+          config: {
+            systemInstruction: buildSystemPrompt(humanize, mode, search),
+            ...(search ? { tools: [{ googleSearch: {} }] } : {}),
+            abortSignal: abort.signal,
+          },
+        });
+        iterator = result[Symbol.asyncIterator]();
+        // Wait for the first chunk: "busy" errors often arrive here, not on the call
+        first = await iterator.next();
+      }
       clearTimeout(timer);
-      usedModel = model;
+      usedModel = isSelf ? `self:${SELF.model}` : model;
       usedSearch = search;
       modelAbort = abort;
       break;
@@ -144,7 +168,7 @@ export async function POST(req) {
       if (req.signal?.aborted) return new Response(null, { status: 499 }); // user hit Stop
       const timedOut = abort.signal.aborted;
       const reason = timedOut ? `no response after ${Math.round(wait / 1000)}s` : shortError(err);
-      const label = `${model}${search ? " +search" : ""}`;
+      const label = isSelf ? `self-hosted ${SELF.model}` : `${model}${search ? " +search" : ""}`;
       failures.push(`${label}: ${reason}`);
       console.warn(`[makbot] ${label} failed, trying next:`, reason);
       // A 400 with search on may just mean "search not available": keep going.
@@ -158,7 +182,8 @@ export async function POST(req) {
             ? COOLDOWN_BUSY_MS
             : 0;
       if (pause) cooldown.set(`${model}|${search}`, Date.now() + pause);
-      if (!timedOut && !searchProblem && !isRetryable(err)) break; // e.g. bad API key
+      // Your own server failing (offline, bad key, no image support) never blocks Gemini
+      if (!isSelf && !timedOut && !searchProblem && !isRetryable(err)) break; // e.g. bad API key
     }
   }
 

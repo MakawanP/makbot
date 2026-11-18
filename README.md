@@ -56,6 +56,24 @@ mic on `localhost` and on HTTPS sites, so it works on Vercel.
 After that, every push to `main` redeploys automatically. If you change environment
 variables, redeploy so they take effect.
 
+## Self-hosted model (optional)
+
+Makbot can use your own model server, such as Gemma 4 26B A4B on vLLM, Ollama, llama.cpp or
+LM Studio, through its OpenAI-compatible API. Text chat then tries your model first and uses
+Gemini as the backup (web search questions still go to Gemini first, since only Gemini can search).
+Replies from your server get a "Self-hosted" tag.
+
+| Variable | What to put |
+|---|---|
+| `SELF_HOSTED_BASE_URL` | Your server's public URL ending in `/v1`, e.g. `https://gemma.example.com/v1` |
+| `SELF_HOSTED_API_KEY` | The key your server expects (leave empty if none) |
+| `SELF_HOSTED_MODEL` | The exact model name your server lists at `/v1/models` |
+| `SELF_HOSTED_PRIORITY` | `first` (default) or `last` to make Gemini the main model |
+| `SELF_HOSTED_TIMEOUT_MS` | How long to wait before falling back to Gemini (default 60000) |
+
+The server must be reachable from the internet. A server on `localhost` or your home network
+needs a tunnel, such as Cloudflare Tunnel. Voice and image creation still use Gemini.
+
 ## Models
 
 | Use | Default |

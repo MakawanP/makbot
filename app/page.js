@@ -231,6 +231,8 @@ export default function Home() {
       }
       if (!res.ok || !res.body) throw new Error(await res.text());
       rememberPassword();
+      const answeredBy = res.headers.get("x-makbot-model") || "";
+      const selfHosted = answeredBy.startsWith("self:") ? answeredBy.slice(5) : undefined;
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -240,7 +242,7 @@ export default function Home() {
         if (done) break;
         raw += decoder.decode(value, { stream: true });
         reply = raw.split(META_MARKER)[0];
-        updateMessages(convId, [...history, replyMsg(reply)]);
+        updateMessages(convId, [...history, replyMsg(reply, { selfHosted })]);
       }
       // Sources from web search arrive after the text
       const metaAt = raw.indexOf(META_MARKER);
@@ -250,6 +252,7 @@ export default function Home() {
           updateMessages(convId, [
             ...history,
             replyMsg(reply, {
+              selfHosted,
               sources: meta.sources?.length ? meta.sources : undefined,
               searchHtml: meta.searchHtml || undefined,
               searchSkipped: meta.searchSkipped || undefined,
@@ -695,6 +698,11 @@ export default function Home() {
                     </button>
                   )}
                   {m.humanized && <span className="badge">Humanized</span>}
+                  {m.selfHosted && (
+                    <span className="badge self" title={`Answered by your own server (${m.selfHosted})`}>
+                      Self-hosted
+                    </span>
+                  )}
                   {m.mode && <span className="badge alt">{MODE_OPTIONS.find((o) => o.value === m.mode)?.label}</span>}
                 </div>
               )}

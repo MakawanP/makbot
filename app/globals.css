@@ -526,3 +526,4 @@ button.ghost {
   .tool { padding: 0 9px; }
 }
 .searchnote { margin-top: 4px; padding-left: 4px; }
+.badge.self { color: #e0a95a; border-color: #5a4320; }
